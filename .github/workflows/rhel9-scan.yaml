@@ -1,0 +1,274 @@
+name: RHEL9 Runtime Scan
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # for actions/checkout to fetch code
+      security-events: write # for github/codeql-action/upload-sarif to upload SARIF results
+      actions: read # only required for a private repository by github/codeql-action/upload-sarif to get the Action run status
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            qemu-system-x86 \
+            qemu-utils \
+            cloud-image-utils \
+            curl \
+            openssh-client \
+            netcat-openbsd \
+            ca-certificates
+
+      - name: Authenticate to Red Hat (service account)
+        run: |
+          TOKEN=$(curl -s https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token \
+            -d "grant_type=client_credentials" \
+            -d "client_id=${{ secrets.REDHAT_CLIENT_ID }}" \
+            -d "client_secret=${{ secrets.REDHAT_CLIENT_SECRET }}" \
+            | jq -r .access_token)
+
+          echo "TOKEN=$TOKEN" >> $GITHUB_ENV
+
+      - name: Store blueprint id
+        run: |
+          BLUEPRINT_ID=${{ secrets.BLUEPRINT_ID }}
+          echo "BLUEPRINT_ID=$BLUEPRINT_ID" >> $GITHUB_ENV
+
+      - name: Check for existing image
+        id: check_image
+        run: |
+          EXISTING_IMAGE_ID=$(curl -s \
+            -H "Authorization: Bearer $TOKEN" \
+            "https://console.redhat.com/api/image-builder/v1/composes?limit=20" \
+            | jq -r --arg ID "$BLUEPRINT_ID" '
+              .data
+              | map(select(
+                  .blueprint_id==$ID
+              ))
+              | sort_by(.created_at)
+              | last
+              | .id // empty
+            ')
+
+          if [ -n "$EXISTING_IMAGE_ID" ]; then
+            echo "🔍 Found image: $EXISTING_IMAGE_ID — checking expiration..."
+            echo "EXISTING_IMAGE_ID=$EXISTING_IMAGE_ID" >> $GITHUB_ENV
+
+            RESPONSE=$(curl -s \
+              -H "Authorization: Bearer $TOKEN" \
+              "https://console.redhat.com/api/image-builder/v1/composes/$EXISTING_IMAGE_ID")
+
+            URL=$(echo "$RESPONSE" | jq -r '.image_status.upload_status.options.url // empty')
+
+            if [ -z "$URL" ]; then
+              echo "⚠️ No download URL found — treating as expired"
+              echo "FOUND=false" >> $GITHUB_ENV
+              exit 0
+            fi
+
+            # Extract query parameters safely
+            AMZ_DATE=$(echo "$URL" | grep -o 'X-Amz-Date=[^&]*' | cut -d= -f2)
+            AMZ_EXPIRES=$(echo "$URL" | grep -o 'X-Amz-Expires=[^&]*' | cut -d= -f2)
+
+            if [ -z "$AMZ_DATE" ] || [ -z "$AMZ_EXPIRES" ]; then
+              echo "⚠️ Could not parse expiration — treating as expired"
+              echo "FOUND=false" >> $GITHUB_ENV
+              exit 0
+            fi
+
+            # Convert AWS timestamp → epoch
+            START_TS=$(date -u -d "${AMZ_DATE:0:8} ${AMZ_DATE:9:2}:${AMZ_DATE:11:2}:${AMZ_DATE:13:2}" +%s)
+            EXPIRY_TS=$((START_TS + AMZ_EXPIRES))
+            NOW=$(date -u +%s)
+
+            echo "🕒 Now:        $NOW"
+            echo "🕒 Expires at: $EXPIRY_TS"
+
+            if [ "$NOW" -lt "$EXPIRY_TS" ]; then
+              echo "✅ Image is still valid"
+              echo "FOUND=true" >> $GITHUB_ENV
+              echo "BUILD_ID=$EXISTING_IMAGE_ID" >> $GITHUB_ENV
+            else
+              echo "❌ Image is expired"
+              echo "FOUND=false" >> $GITHUB_ENV
+            fi
+
+          else
+            echo "❌ No matching image found"
+            echo "FOUND=false" >> $GITHUB_ENV
+          fi
+
+      - name: Start image build
+        if: env.FOUND == 'false'
+        run: |
+          echo "🚀 Starting image build"
+
+          RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}\n" -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://console.redhat.com/api/image-builder/v1/blueprints/${BLUEPRINT_ID}/compose" \
+            -d '{
+              "image_requests": [
+                {
+                  "architecture": "x86_64",
+                  "image_type": "guest-image",
+                  "upload_request": {
+                    "type": "aws.s3",
+                    "options": {}
+                  }
+                }
+              ]
+            }')
+
+          HTTP_STATUS=$(echo "$RESPONSE" | grep HTTP_STATUS | cut -d: -f2)
+          BODY=$(echo "$RESPONSE" | sed '/HTTP_STATUS/d')
+
+          echo "🔎 HTTP Status: $HTTP_STATUS"
+
+          BUILD_ID=$(echo "$BODY" | jq -r '.id // empty')
+
+          if [ -z "$BUILD_ID" ]; then
+            echo "❌ Failed to start build — no ID returned"
+            exit 1
+          fi
+
+          echo "✅ Build started."
+          echo "BUILD_ID=$BUILD_ID" >> $GITHUB_ENV
+
+      - name: Wait for build
+        if: env.FOUND == 'false'
+        run: |
+          for i in {1..60}; do
+            RESPONSE=$(curl -s \
+              -H "Authorization: Bearer $TOKEN" \
+              https://console.redhat.com/api/image-builder/v1/composes/$BUILD_ID)
+
+            IMAGE_NAME=$(echo "$RESPONSE" | jq -r .image_name)
+
+            if [ "$IMAGE_NAME" != "null" ]; then
+              echo "✅ Build appears ready"
+              exit 0
+            fi
+
+            echo "⏳ Waiting for build..."
+            sleep 30
+          done
+
+          echo "❌ Build timed out"
+          exit 1
+
+      - name: Download image
+        run: |
+          DOWNLOAD_URL=$(curl -s \
+            -H "Authorization: Bearer $TOKEN" \
+            https://console.redhat.com/api/image-builder/v1/composes/$BUILD_ID \
+            | jq -r '.image_status.upload_status.options.url')
+
+          echo "Downloading from: $DOWNLOAD_URL"
+
+          curl -L --retry 5 -o rhel9.img "$DOWNLOAD_URL"
+
+      - name: Generate SSH key
+        run: |
+          ssh-keygen -t rsa -b 4096 -f id_rsa -N ""
+
+      - name: Create cloud-init config
+        run: |
+          cat > user-data <<EOF
+          #cloud-config
+          users:
+            - name: clouduser
+              sudo: ALL=(ALL) NOPASSWD:ALL
+              groups: wheel
+              shell: /bin/bash
+              ssh_authorized_keys:
+                - $(cat id_rsa.pub)
+          ssh_pwauth: false
+          disable_root: true
+          EOF
+
+          cloud-localds seed.iso user-data
+
+      - name: Start RHEL9 VM
+        run: |
+          qemu-system-x86_64 \
+            -m 2048 \
+            -smp 2 \
+            -machine type=q35,accel=tcg \
+            -cpu max \
+            -drive file=rhel9.img,format=qcow2,if=virtio \
+            -drive file=seed.iso,format=raw,if=virtio \
+            -boot c \
+            -netdev user,id=net0,hostfwd=tcp::2222-:22 \
+            -device virtio-net-pci,netdev=net0 \
+            -nographic \
+            -serial mon:stdio \
+            > vm.log 2>&1 &
+
+          echo $! > vm.pid
+
+      - name: Wait for SSH to be fully ready
+        run: |
+          for i in {1..120}; do
+            if ssh -i id_rsa \
+              -o StrictHostKeyChecking=no \
+              -o ConnectTimeout=2 \
+              -o BatchMode=yes \
+              -p 2222 clouduser@localhost "echo ready" >/dev/null 2>&1; then
+              echo "✅ SSH is fully ready"
+              exit 0
+            fi
+            echo "⏳ Waiting for SSH..."
+            sleep 2
+          done
+          echo "❌ SSH failed to become ready"
+          exit 1
+
+      - name: Dump VM logs
+        if: failure()
+        run: cat vm.log || true
+
+      - name: Run Trivy scan inside VM
+        run: |
+          ssh -i id_rsa -p 2222 clouduser@localhost <<'EOF'
+          set -e
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh
+          sudo ./bin/trivy rootfs / \
+            --scanners vuln,misconfig \
+            -f sarif \
+            -o /tmp/report.sarif
+          EOF
+
+      - name: Copy report from VM
+        run: |
+          scp -i id_rsa -P 2222 \
+            -o StrictHostKeyChecking=no \
+            clouduser@localhost:/tmp/report.sarif \
+            report.sarif
+
+      - name: Stop VM
+        if: always()
+        run: |
+          kill $(cat vm.pid) || true
+
+      - name: Upload SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: report.sarif
